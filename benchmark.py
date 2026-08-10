@@ -36,10 +36,12 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from detection.ensemble_detector import EnsembleDetector, EnsembleResult
 
@@ -176,13 +178,44 @@ def load_prompts(path: Path) -> List[str]:
     return prompts
 
 
-def run_all(detector: EnsembleDetector, prompts: List[str]) -> List[EnsembleResult]:
+def run_all(
+    detector: EnsembleDetector, prompts: List[str]
+) -> Tuple[List[EnsembleResult], List[float]]:
     """Score each prompt once (threshold=0) so the sweep can reuse the results.
 
     Returns the full results, not just scores: the per-prompt tier breakdown in
     --out needs method_scores and details, which a bare score list throws away.
+    Also returns per-prompt wall time in ms, so any latency figure in the docs
+    comes from a measurement rather than an estimate. With --adjudicator that
+    time includes the LLM round-trip for prompts inside the band.
     """
-    return [detector.detect(p, threshold=0) for p in prompts]
+    results: List[EnsembleResult] = []
+    elapsed_ms: List[float] = []
+    for prompt in prompts:
+        start = time.perf_counter()
+        result = detector.detect(prompt, threshold=0)
+        elapsed_ms.append((time.perf_counter() - start) * 1000.0)
+        results.append(result)
+    return results, elapsed_ms
+
+
+def _percentile(values: List[float], pct: float) -> float:
+    """Nearest-rank percentile. Avoids a numpy dependency for a handful of numbers."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    rank = math.ceil(pct / 100.0 * len(ordered))
+    return ordered[min(max(rank, 1), len(ordered)) - 1]
+
+
+def latency_stats(elapsed_ms: List[float]) -> Dict[str, float]:
+    """Summarize per-prompt timings for the console and --out."""
+    return {
+        "mean": sum(elapsed_ms) / len(elapsed_ms) if elapsed_ms else 0.0,
+        "p50": _percentile(elapsed_ms, 50),
+        "p95": _percentile(elapsed_ms, 95),
+        "max": max(elapsed_ms) if elapsed_ms else 0.0,
+    }
 
 
 def _provenance(prompt: str, result: EnsembleResult, label: str, index: int) -> Dict[str, Any]:
@@ -292,10 +325,11 @@ def main() -> None:
     adjudicator = _build_adjudicator() if args.adjudicator else None
     detector = EnsembleDetector(adjudicator=adjudicator, borderline_band=(floor, ceil))
     logger.info("Deep LLM tier: %s", f"ON (band {floor:.0f}-{ceil:.0f})" if adjudicator else "OFF")
-    attack_results = run_all(detector, attacks)
-    benign_results = run_all(detector, benign)
+    attack_results, attack_ms = run_all(detector, attacks)
+    benign_results, benign_ms = run_all(detector, benign)
     attack_scores = [r.risk_score for r in attack_results]
     benign_scores = [r.risk_score for r in benign_results]
+    latency = latency_stats(attack_ms + benign_ms)
 
     print("\n=== Prompt Shield benchmark ===")
     if using_starter:
@@ -313,6 +347,13 @@ def main() -> None:
     print(
         f"\n  Best F1 at threshold {best.threshold:.0f}: "
         f"F1 {best.f1:.1%}, recall {best.recall:.1%}, FPR {best.fpr:.1%}"
+    )
+
+    scope = "includes LLM round-trips" if adjudicator else "fast path only"
+    print(
+        f"\n  Latency per prompt ({scope}): "
+        f"p50 {latency['p50']:.2f} ms, p95 {latency['p95']:.2f} ms, "
+        f"max {latency['max']:.2f} ms"
     )
 
     # Tier breakdown: how much of the verdict the deep layer actually carried.
@@ -346,6 +387,11 @@ def main() -> None:
             # Recorded so two result files can be told apart when comparing runs.
             "adjudicator": bool(adjudicator),
             "band": [floor, ceil] if adjudicator else None,
+            "latency_ms": {
+                **{k: round(v, 4) for k, v in latency.items()},
+                # Adjudicated runs are network-bound; don't quote them as engine speed.
+                "includes_llm_calls": bool(adjudicator),
+            },
             "attacks": len(attacks),
             "benign": len(benign),
             "results": [

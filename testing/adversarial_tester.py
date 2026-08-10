@@ -8,8 +8,8 @@ attack variants and measures detector performance across multiple dimensions.
 Why Adversarial Testing Matters:
     Prompt injection attackers don't use simple, direct attacks. They use
     obfuscation, encoding, character substitution, and other evasion techniques.
-    A detector that works on "Ignore all instructions" but fails on
-    "1gn0r3 4ll 1nstruct10ns" isn't production-ready.
+    A detector that catches an attack in plain text but misses the same attack in
+    leetspeak has not actually detected the attack; it has matched a spelling.
 
 Testing Philosophy:
     Red team your own system BEFORE attackers do. This suite acts as an
@@ -466,7 +466,9 @@ class AdversarialTester:
     Why This Matters:
         A detector that works on simple attacks but fails on obfuscated variants
         provides a false sense of security. Real attackers WILL use evasion.
-        This tester ensures your detector is production-ready.
+        This tester measures how far that gap goes; it does not close it. Passing
+        it means the detector survived these specific evasions, not that it is
+        robust in general.
     
     Key Capabilities:
         - Generate unlimited attack variants automatically
@@ -487,7 +489,7 @@ class AdversarialTester:
         >>> from detection.ensemble_detector import EnsembleDetector
         >>> 
         >>> # Initialize
-        >>> detector = EnsembleDetector(threshold=50.0)
+        >>> detector = EnsembleDetector()  # threshold is per-call, 0-100
         >>> tester = AdversarialTester(detector)
         >>> 
         >>> # Quick test with specific evasion technique

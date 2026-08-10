@@ -17,10 +17,17 @@ Features:
 """
 
 import os
-import anthropic
-from detection.ensemble_detector import EnsembleDetector
+import sys
 import logging
 from datetime import datetime
+from pathlib import Path
+
+import anthropic
+
+# Run from anywhere: put the repo root on sys.path before importing the package.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from detection.ensemble_detector import EnsembleDetector
 
 # Configure logging
 logging.basicConfig(
@@ -33,13 +40,14 @@ logger = logging.getLogger(__name__)
 class ProtectedChatbot:
     """Chatbot with built-in prompt injection protection."""
     
-    def __init__(self, api_key: str = None, detection_threshold: float = 0.7):
+    def __init__(self, api_key: str = None, detection_threshold: float = 50.0):
         """
         Initialize protected chatbot.
         
         Args:
             api_key: Anthropic API key (or set ANTHROPIC_API_KEY env var)
-            detection_threshold: Prompt-Shield sensitivity (0.6-0.8 recommended)
+            detection_threshold: Risk score at or above which a message is
+                refused, on the detector's 0-100 scale (default 50)
         """
         self.api_key = api_key or os.environ.get('ANTHROPIC_API_KEY')
         if not self.api_key:
@@ -49,10 +57,12 @@ class ProtectedChatbot:
             )
         
         self.client = anthropic.Anthropic(api_key=self.api_key)
-        self.detector = EnsembleDetector(threshold=detection_threshold)
+        # Threshold is a per-call argument, not detector state.
+        self.detector = EnsembleDetector()
+        self.detection_threshold = detection_threshold
         self.conversation_history = []
-        
-        logger.info(f"Chatbot initialized with threshold={detection_threshold}")
+
+        logger.info("Chatbot initialized with threshold=%.0f", detection_threshold)
     
     def chat(self, user_message: str) -> dict:
         """
@@ -71,7 +81,9 @@ class ProtectedChatbot:
         logger.info(f"Processing message: {user_message[:50]}...")
         
         # Pre-screen with Prompt-Shield
-        detection_result = self.detector.detect(user_message)
+        detection_result = self.detector.detect(
+            user_message, threshold=self.detection_threshold
+        )
         
         if detection_result.is_injection:
             # Block malicious prompt
@@ -87,8 +99,12 @@ class ProtectedChatbot:
                     "Please rephrase your question in a straightforward manner."
                 ),
                 'blocked': True,
+                'risk_score': detection_result.risk_score,
                 'confidence': detection_result.confidence,
-                'reason': detection_result.explanation
+                # Kept internal on purpose. Surfacing which patterns fired lets a
+                # caller iterate until nothing matches, and it is attacker-derived
+                # text once the LLM tier has run. Log it; do not display it.
+                '_internal_reason': detection_result.explanation,
             }
         
         # Safe - send to Claude

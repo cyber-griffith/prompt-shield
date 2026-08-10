@@ -43,10 +43,14 @@ print(f"Detected by: {result.detection_methods}")
 **Expected Output:**
 ```
 Is Malicious: True
-Confidence: 95%
-Risk Score: 87.5/100
-Detected by: ['rule_based', 'semantic']
+Confidence: 67.1%
+Risk Score: 97.0/100
+Detected by: ['rule_based']
 ```
+
+`confidence` measures agreement *between layers*, not probability of attack. It is
+67.1% here because only the rule layer scored this prompt highly — the layers
+disagree, even though the verdict is right. Judge the verdict on `risk_score`.
 
 ### Step 3: Test Multiple Prompts (1 minute)
 
@@ -99,7 +103,8 @@ from flask import Flask, request, jsonify
 from detection.ensemble_detector import EnsembleDetector
 
 app = Flask(__name__)
-detector = EnsembleDetector(threshold=50.0)
+detector = EnsembleDetector()
+BLOCK_THRESHOLD = 50.0  # risk score 0-100, applied per call
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
@@ -157,13 +162,14 @@ from detection.ensemble_detector import EnsembleDetector
 
 class ProtectedRAG:
     def __init__(self, retriever, llm):
-        self.detector = EnsembleDetector(threshold=60.0)  # Lenient for Q&A
+        self.detector = EnsembleDetector()
+        self.threshold = 60.0  # Lenient for Q&A
         self.retriever = retriever
         self.llm = llm
     
     def query(self, user_query: str) -> str:
         # Check query safety
-        result = self.detector.detect(user_query)
+        result = self.detector.detect(user_query, threshold=self.threshold)
         
         if result.is_injection:
             # Log the attempt
@@ -313,11 +319,12 @@ for evasion, stats in report.evasion_breakdown.items():
 ```python
 class ProtectedPlugin:
     def __init__(self):
-        self.detector = EnsembleDetector(threshold=55.0)
+        self.detector = EnsembleDetector()
+        self.threshold = 55.0
     
     def process_request(self, user_input: str) -> dict:
         # Check for injection
-        result = self.detector.detect(user_input)
+        result = self.detector.detect(user_input, threshold=self.threshold)
         
         if result.is_injection:
             return {
@@ -335,12 +342,13 @@ class ProtectedPlugin:
 ```python
 class SupportChatbot:
     def __init__(self):
-        self.detector = EnsembleDetector(threshold=60.0)
+        self.detector = EnsembleDetector()
+        self.threshold = 60.0
         self.llm = YourLLMModel()
     
     def respond(self, customer_message: str) -> str:
         # Pre-check customer input
-        result = self.detector.detect(customer_message)
+        result = self.detector.detect(customer_message, threshold=self.threshold)
         
         if result.is_injection:
             # Log for security team
@@ -356,11 +364,12 @@ class SupportChatbot:
 ```python
 class InternalAIAssistant:
     def __init__(self):
+        self.detector = EnsembleDetector()
         # Lenient threshold for trusted internal users
-        self.detector = EnsembleDetector(threshold=70.0)
+        self.threshold = 70.0
     
     def process_query(self, employee_query: str) -> str:
-        result = self.detector.detect(employee_query)
+        result = self.detector.detect(employee_query, threshold=self.threshold)
         
         if result.is_injection:
             # Alert security, but allow with warning
