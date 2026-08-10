@@ -76,9 +76,56 @@ import logging
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
+from detection.adjudicator import LLMAdjudicator, AdjudicationResult
 import re
 import json
+import base64
+import codecs
+import unicodedata
 
+
+# Invisible / zero-width characters used to smuggle text past filters.
+_INVISIBLE = dict.fromkeys(
+    map(ord, "\u200b\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2060\ufeff\u00ad"),
+    None,
+)
+
+
+def _deobfuscated_variants(text: str) -> List[str]:
+    """Return the normalized prompt plus any plausible decodes of it.
+
+    Strips invisible characters, NFKC-normalizes unicode homoglyphs, and decodes
+    base64/hex/ROT13 blobs. A decode is kept only when it looks like natural
+    language, so random tokens (keys, hashes) add no noise. The rule detector
+    scans every variant, so an injection hidden in an encoded blob still gets caught.
+    """
+    normalized = unicodedata.normalize("NFKC", text.translate(_INVISIBLE))
+    variants = [normalized]
+
+    def _textual(s: str) -> bool:
+        return len(s) >= 6 and sum(c.isalpha() or c.isspace() for c in s) / len(s) > 0.7
+
+    for token in re.findall(r"[A-Za-z0-9+/]{16,}={0,2}", normalized):
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8", "ignore")
+            if _textual(decoded):
+                variants.append(decoded)
+        except Exception:
+            pass
+
+    for token in re.findall(r"(?:[0-9a-fA-F]{2}){8,}", normalized):
+        try:
+            decoded = bytes.fromhex(token).decode("utf-8", "ignore")
+            if _textual(decoded):
+                variants.append(decoded)
+        except Exception:
+            pass
+
+    rot13 = codecs.decode(normalized, "rot_13")
+    if _textual(rot13):
+        variants.append(rot13)
+
+    return variants
 
 @dataclass
 class EnsembleResult:
@@ -215,103 +262,94 @@ class RuleBasedDetector:
         self._load_patterns()
     
     def _load_patterns(self):
-        """Load detection patterns for all attack categories.
-        
-        Patterns are organized by attack type for maintainability and extensibility.
-        All patterns use case-insensitive matching to catch variations.
-        """
-        # Instruction manipulation patterns
+        """Load detection patterns. Matched against the lowercased prompt, so
+        every pattern here must be lowercase."""
         self.instruction_patterns = [
-            r"ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|commands?|rules?)",
-            r"disregard\s+(all\s+)?(previous|prior|above)\s+(instructions?|directions?)",
-            r"forget\s+(everything|all)\s+(you\s+)?(were\s+)?(told|instructed)",
-            r"new\s+(instruction|command|rule|directive)s?:",
-            r"system\s+(override|prompt|message):",
-            r"override\s+(previous|all)\s+(settings?|instructions?)",
+            r"ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|commands?|rules?|prompts?)",
+            r"disregard\s+(all\s+)?(previous|prior|above|earlier)?\s*(instructions?|directions?|rules?|guidelines?)",
+            r"forget\s+(everything|all|the|your|any|previous|prior)\b.{0,25}?(instructions?|guidelines?|rules?|told|instructed)",
+            r"new\s+(instruction|command|rule|directive)s?\s*:",
+            r"system\s+(override|prompt|message)\s*:",
+            r"override\s+(previous|all|prior|your)\s+(settings?|instructions?|rules?)",
         ]
-        
-        # Role manipulation patterns
         self.role_patterns = [
             r"you\s+are\s+now\s+(a|an)\s+",
             r"act\s+as\s+(if\s+)?(you\s+are\s+)?(a|an)\s+",
-            r"pretend\s+(you\s+are|to\s+be)\s+(a|an)\s+",
-            r"simulate\s+(being\s+)?(a|an)\s+",
-            r"roleplay\s+as\s+(a|an)\s+",
+            r"pretend\s+(you\s+are|to\s+be|you\s+have)\s+",
+            r"simulate\s+(being\s+|an?\s+)",
+            r"roleplay|role-play",
         ]
-        
-        # Prompt leaking patterns
         self.leak_patterns = [
-            r"(show|display|reveal|print|output)\s+(your\s+)?(system\s+)?(prompt|instructions?)",
-            r"what\s+(are|is)\s+your\s+(system\s+)?(prompt|instructions?)",
-            r"repeat\s+(your\s+)?(initial|original|system)\s+(prompt|instructions?)",
-            r"(tell|show)\s+me\s+your\s+(hidden|secret)\s+instructions?",
+            r"(show|display|reveal|print|output)\s+(me\s+)?(your\s+|the\s+)?(system\s+|hidden\s+|secret\s+|internal\s+)?(prompt|instructions?|configuration)",
+            r"what\s+(are|is|were)\s+your\s+(system\s+)?(prompt|instructions?)",
+            r"repeat\s+(your\s+|the\s+)?(initial\s+|original\s+|system\s+){0,3}(prompt|instructions?)",
+            r"(tell|show)\s+me\s+(your\s+|the\s+)?(hidden|secret|internal|system)\s+(instructions?|prompt)",
         ]
-        
-        # Jailbreak patterns
         self.jailbreak_patterns = [
-            r"dan\s+mode",
-            r"developer\s+mode",
-            r"SUDO\s+mode",
-            r"unrestricted\s+mode",
-            r"do\s+anything\s+now",
-            r"content\s+policy\s+override",
+            r"dan\s+mode", r"developer\s+mode", r"sudo\s+mode",
+            r"unrestricted\s+mode", r"do\s+anything\s+now", r"content\s+policy\s+override",
         ]
-        
-        # Context manipulation
         self.context_patterns = [
-            r"---\s*END\s+OF\s+(CONTEXT|PROMPT|INSTRUCTIONS?)",
-            r"^\s*\[SYSTEM\]",
-            r"<\|endoftext\|>",
-            r"<\|im_start\|>",
-            r"</s>",
+            r"[-#*=]{2,}\s*end\s+of\s+(context|prompt|instructions?)",
+            r"\[\s*system\s*\]",
+            r"<\|endoftext\|>", r"<\|im_start\|>", r"</s>",
+        ]
+        self.negation_patterns = [
+            r"(no|without|ignore|bypass|disable|remove)\s+(any\s+|your\s+|all\s+)?(restrictions?|rules?|guidelines?|filters?|limits?|safety|content\s+polic(y|ies)|censorship)",
+            r"(you\s+have|there\s+are)\s+no\s+(restrictions?|rules?|limits?|guidelines?)",
+            r"unrestricted|unfiltered|uncensored|jailbroken",
         ]
     
+    # High-precision category base scores. These regexes only match explicit
+    # injection phrasing, so a single hit is a strong signal and scores high on
+    # its own. Roleplay is sometimes benign, so it scores lower.
+    _CATEGORY_BASE = {
+        "instruction_manipulation": 85,
+        "prompt_leaking": 80,
+        "jailbreak": 90,
+        "context_manipulation": 75,
+        "role_manipulation": 60,
+        "policy_negation": 80,
+    }
+
     def detect(self, prompt: str) -> Tuple[float, Dict[str, Any]]:
+        """Detect prompt injection via high-precision regex patterns.
+
+        Returns (score, details), 0-100. A single explicit match scores high;
+        additional matched categories raise confidence. Benign prompts should
+        score ~0 because the patterns are precise.
         """
-        Detect prompt injection using rules
-        
-        Returns:
-            (score, details) where score is 0-100
-        """
-        score = 0.0
-        details = {
-            "matched_patterns": [],
-            "category_scores": {}
-        }
-        
+        details = {"matched_patterns": [], "category_scores": {}}
         prompt_lower = prompt.lower()
-        
-        # Check each pattern category
+
         categories = [
-            ("instruction_manipulation", self.instruction_patterns, 30),
-            ("role_manipulation", self.role_patterns, 25),
-            ("prompt_leaking", self.leak_patterns, 20),
-            ("jailbreak", self.jailbreak_patterns, 35),
-            ("context_manipulation", self.context_patterns, 40),
+            ("instruction_manipulation", self.instruction_patterns),
+            ("role_manipulation", self.role_patterns),
+            ("prompt_leaking", self.leak_patterns),
+            ("jailbreak", self.jailbreak_patterns),
+            ("context_manipulation", self.context_patterns),
+            ("policy_negation", self.negation_patterns),
         ]
-        
-        for category, patterns, weight in categories:
+
+        hit_scores = []
+        for category, patterns in categories:
             matches = 0
             for pattern in patterns:
                 if re.search(pattern, prompt_lower):
                     matches += 1
-                    details["matched_patterns"].append({
-                        "category": category,
-                        "pattern": pattern
-                    })
-            
-            if matches > 0:
-                # Calculate category score
-                category_score = min(100, matches * 30)  # Cap at 100
-                details["category_scores"][category] = category_score
-                
-                # Add weighted score to total
-                score += (category_score / 100.0) * weight
-        
-        # Normalize score to 0-100
-        score = min(100, score)
-        
-        return score, details
+                    details["matched_patterns"].append({"category": category, "pattern": pattern})
+            if matches:
+                cat_score = min(100, self._CATEGORY_BASE[category] + (matches - 1) * 8)
+                details["category_scores"][category] = cat_score
+                hit_scores.append(cat_score)
+
+        if not hit_scores:
+            return 0.0, details
+
+        # Strongest signal dominates; extra categories add confidence.
+        hit_scores.sort(reverse=True)
+        score = hit_scores[0] + sum(hit_scores[1:]) * 0.15
+        return min(100, score), details
 
 
 class StatisticalDetector:
@@ -633,7 +671,10 @@ class EnsembleDetector:
         ...     return {'response': llm.generate(prompt)}
     """
     
-    def __init__(self, weights: Optional[Dict[str, float]] = None):
+    def __init__(self, weights=None, adjudicator=None, borderline_band=(30.0, 65.0)):
+        # ... keep your existing weight setup ...
+        self.adjudicator = adjudicator
+        self._band = borderline_band
         """Initialize ensemble detector with configurable method weights.
         
         Args:
@@ -741,8 +782,12 @@ class EnsembleDetector:
         """
         self.logger.debug(f"Running ensemble detection on prompt (length: {len(prompt)})")
         
-        # Run all detectors
-        rule_score, rule_details = self.rule_detector.detect(prompt)
+        # Rule layer scans the original AND de-obfuscated variants, taking the
+        # strongest hit, so base64/hex/ROT13/invisible-char evasions are caught.
+        rule_variants = [self.rule_detector.detect(v) for v in _deobfuscated_variants(prompt)]
+        rule_score, rule_details = max(rule_variants, key=lambda r: r[0])
+
+        # Statistical and semantic run on the original prompt.
         stat_score, stat_details = self.statistical_detector.detect(prompt)
         semantic_score, semantic_details = self.semantic_detector.detect(prompt)
         
@@ -760,6 +805,24 @@ class EnsembleDetector:
             semantic_score * self.weights["semantic"]
         )
         
+        # High-precision override: an explicit rule match is near-certain
+        # injection, so it must not be averaged away by quiet statistical or
+        # semantic scores. Safe because the rule patterns are precise.
+        if rule_score >= 70:
+            ensemble_score = max(ensemble_score, rule_score)
+            
+        # Deep-inspection tier: only for borderline scores the fast layers are
+        # unsure about. A confident fast-path decision is never second-guessed,
+        # which is also what keeps the LLM cost bounded to a fraction of prompts.
+        adjudication = None
+        if self.adjudicator is not None and self._band[0] <= ensemble_score <= self._band[1]:
+            adjudication = self.adjudicator.adjudicate(prompt)
+            if adjudication.score is not None:  # None means it abstained; leave score alone
+                ensemble_score = adjudication.score
+                method_scores["adjudicator"] = adjudication.score
+
+        is_injection = ensemble_score >= threshold
+        
         # Calculate confidence based on agreement
         confidence = self._calculate_confidence(method_scores)
         
@@ -772,7 +835,9 @@ class EnsembleDetector:
             "statistical": stat_details,
             "semantic": semantic_details,
             "threshold": threshold,
-            "agreement_level": confidence
+            "agreement_level": confidence,
+            "adjudicator": adjudication.reason 
+                if adjudication else None
         }
         
         # Identify contributing methods
