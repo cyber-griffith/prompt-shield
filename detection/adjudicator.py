@@ -77,7 +77,36 @@ class AdjudicationResult:
     reason: str
 
 
-_ABSTAIN = AdjudicationResult("abstain", 0.0, None, "adjudicator abstained")
+# Fixed vocabulary of abstain causes. `reason` is the only channel that records
+# WHY no verdict was obtained, and it is written to logs and to benchmark --out,
+# so it must never carry model output: that text derives from attacker-controlled
+# input and echoing it would reopen the injection channel this tier exists to
+# close. Enumerable codes also mean a run's abstains can be counted by kind
+# rather than read one at a time -- the difference between "91 abstains" and
+# "91 abstains, 88 of them rate limits".
+_ABSTAIN_EMPTY_INPUT = "empty_input"
+_ABSTAIN_EMPTY_OUTPUT = "empty_output"
+_ABSTAIN_OVERSIZED = "oversized_output"
+_ABSTAIN_REFUSED = "refused"
+_ABSTAIN_NO_JSON = "no_json_object"
+_ABSTAIN_BAD_JSON = "json_decode_error"
+_ABSTAIN_NOT_OBJECT = "not_an_object"
+_ABSTAIN_BAD_FIELD = "bad_injection_field"
+_ABSTAIN_CALL_FAILED = "call_failed"  # suffixed with the exception type name
+
+# Markers of a model declining to classify rather than answering badly. Only
+# consulted when no JSON object was found, so a refusal is separated from a
+# malformed answer instead of both landing in one bucket.
+_REFUSAL_MARKERS = (
+    "i can't", "i cannot", "i can not", "i'm unable", "i am unable",
+    "i won't", "i will not", "i'm not able", "i am not able",
+    "sorry", "as an ai", "i must decline", "i'm not going to",
+)
+
+
+def _abstain(cause: str) -> AdjudicationResult:
+    """Build an abstain result carrying a machine-readable cause code."""
+    return AdjudicationResult("abstain", 0.0, None, f"abstain:{cause}")
 
 _SYSTEM_PROMPT = (
     "You are a security classifier inside an authorized prompt-injection detection "
@@ -103,22 +132,30 @@ def _build_user_content(prompt: str, fence: str) -> str:
 
 def _parse_verdict(raw: str) -> AdjudicationResult:
     """Parse the model's JSON verdict defensively. Any deviation -> abstain."""
-    if not raw or len(raw) > _MAX_OUTPUT_CHARS:
-        return _ABSTAIN
+    if not raw:
+        return _abstain(_ABSTAIN_EMPTY_OUTPUT)
+    if len(raw) > _MAX_OUTPUT_CHARS:
+        return _abstain(_ABSTAIN_OVERSIZED)
 
     match = re.search(r"\{.*\}", raw, re.DOTALL)  # tolerate stray wrapping text
     if match is None:
-        return _ABSTAIN
+        # A refusal and a garbled answer both lack JSON but mean different
+        # things: one is the model declining the task, the other is it failing
+        # at it. Only the first is fixed by changing the prompt.
+        probe = raw[:200].lower()
+        if any(marker in probe for marker in _REFUSAL_MARKERS):
+            return _abstain(_ABSTAIN_REFUSED)
+        return _abstain(_ABSTAIN_NO_JSON)
     try:
         data = json.loads(match.group(0))
     except (json.JSONDecodeError, ValueError):
-        return _ABSTAIN
+        return _abstain(_ABSTAIN_BAD_JSON)
 
     if not isinstance(data, dict):
-        return _ABSTAIN
+        return _abstain(_ABSTAIN_NOT_OBJECT)
     is_injection = data.get("injection")
     if not isinstance(is_injection, bool):  # reject strings like "true", nulls, etc.
-        return _ABSTAIN
+        return _abstain(_ABSTAIN_BAD_FIELD)
 
     try:
         confidence = float(data.get("confidence", 0.0))
@@ -133,7 +170,10 @@ def _parse_verdict(raw: str) -> AdjudicationResult:
 
 
 class LLMAdjudicator:
-    """Deep-inspection tier for borderline prompts.
+    """Deep-inspection tier for prompts the fast path could not resolve.
+
+    Which prompts those are is the caller's decision, set by the score band in
+    EnsembleDetector. This class does not assume they are rare or borderline.
 
     The LLM call is injected as ``chat_fn(system_prompt, user_content) -> str``,
     so this class imports no provider SDK and never touches credentials.
@@ -170,7 +210,7 @@ class LLMAdjudicator:
             answer was obtained, so the caller keeps its fast-path decision.
         """
         if not isinstance(prompt, str) or not prompt.strip():
-            return _ABSTAIN
+            return _abstain(_ABSTAIN_EMPTY_INPUT)
 
         safe_prompt = prompt[: self._max_input_chars]
         fence = uuid.uuid4().hex  # unguessable: the payload cannot forge or close it
@@ -178,10 +218,18 @@ class LLMAdjudicator:
         try:
             raw = self._chat_fn(_SYSTEM_PROMPT, _build_user_content(safe_prompt, fence))
         except Exception as exc:  # noqa: BLE001 - the tier must never crash detection
-            # Log the error TYPE only, never the hostile prompt or full message.
+            # Error TYPE only, never the hostile prompt or the full message. The
+            # type name is what separates a timeout from a rate limit from an
+            # auth failure, which is the whole diagnostic value.
             logger.warning("Adjudicator call failed, abstaining: %s", type(exc).__name__)
-            return _ABSTAIN
+            return _abstain(f"{_ABSTAIN_CALL_FAILED}:{type(exc).__name__}")
 
         result = _parse_verdict(raw if isinstance(raw, str) else "")
-        logger.debug("Adjudication verdict=%s confidence=%.2f", result.verdict, result.confidence)
+        if result.verdict == "abstain":
+            # INFO, not DEBUG: a tier that silently abstains at scale looks
+            # identical to one that is working and agreeing. It is not.
+            logger.info("Adjudicator abstained (%s)", result.reason)
+        else:
+            logger.debug("Adjudication verdict=%s confidence=%.2f",
+                         result.verdict, result.confidence)
         return result

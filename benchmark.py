@@ -15,15 +15,32 @@ Author: Jace
 Version: 0.1.0
 
 Usage:
-    python benchmark.py                                  # built-in starter sets
-    python benchmark.py --attacks rts_log.jsonl --sweep  # your RTS corpus as attacks
-    python benchmark.py --attacks a.jsonl --benign b.json --out results.json
-    python benchmark.py --sweep --out fast.json          # fast path only
-    python benchmark.py --sweep --adjudicator --band 20 65 --out deep.json  # + deep tier
+    # 1. Pick the operating threshold on DEV (the built-in starter sets):
+    python benchmark.py --sweep --pick-threshold
+
+    # 2. Apply it, unchanged, to the held-out set. Benign corpora compose:
+    python benchmark.py --attacks rts_log.jsonl \
+        --benign eval/benign_test.jsonl eval/hard_negatives.jsonl \
+        --threshold 20 --sweep --out fast_test.json
+
+    # 3. Same threshold, same corpora, deep tier on:
+    python benchmark.py ... --threshold 20 --adjudicator --band 0 70 \
+        --workers 8 --out deep_test.json
 
 Comparing the two --out files is the measurement: the delta is what the LLM tier
 buys. The fast-path run is the stable, reproducible baseline; the adjudicated run
 calls a live model and will wiggle slightly between runs.
+
+--threshold is the reported operating point and --sweep never moves it. Reading
+a threshold off the sweep on held-out data fits it to the test set, so that is
+gated behind --pick-threshold and belongs on DEV only.
+
+--band is the escalation policy. A narrow band assumes a low fast-path score is
+evidence of innocence. That assumption is worth checking against the corpus
+before trusting it: if whole attack categories score zero, a narrow band routes
+almost nothing and the deep tier cannot help. --band 0 70 is the other end --
+escalate everything the rules did not confidently block, which costs an API call
+for most prompts and is how you measure the ceiling the deep tier can reach.
 
 --out also carries a per_prompt array recording which tier decided each verdict
 (fast-path rule, weighted ensemble, or deep LLM), keyed by a stable prompt hash
@@ -38,7 +55,9 @@ import json
 import logging
 import math
 import os
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -52,6 +71,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("shield.benchmark")
 
+# Attack corpora contain zero-width and homoglyph characters by design -- that is
+# the evasion technique. A cp1252 console cannot encode them, so echoing a missed
+# attack would crash the benchmark on the very inputs it exists to measure.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # Thresholds to walk when --sweep is passed.
 _SWEEP = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
@@ -64,8 +90,13 @@ _RULE_OVERRIDE = 70.0
 _PREVIEW_CHARS = 120
 
 # Keys a prompt might live under when loading objects from JSON/JSONL. RTS uses
-# "generated_prompt", so an attack_log.jsonl works directly. First match wins.
+# "attack_prompt", so an attack_log.jsonl works directly. First match wins.
 _PROMPT_KEYS = ("generated_prompt", "prompt", "attack_prompt", "text", "input")
+
+# Keys carrying the slice a prompt belongs to: attack category for the RTS corpus,
+# benign subtype for eval/benign_test.jsonl. Drives the per-slice breakdown.
+_GROUP_KEYS = ("category", "subtype", "group", "label")
+_UNGROUPED = "unlabelled"
 
 # Built-in starter sets. Small and diverse on purpose: enough for a first honest
 # read, not enough for a resume number. Point --attacks / --benign at your RTS
@@ -151,11 +182,16 @@ class Metrics:
         return self.fp / denom if denom else 0.0
 
 
-def load_prompts(path: Path) -> List[str]:
-    """Load prompts from a .json list or a .jsonl stream.
+def load_prompts(path: Path) -> List[Tuple[str, str]]:
+    """Load (prompt, group) pairs from a .json list or a .jsonl stream.
 
     Accepts a plain list of strings, or objects carrying the prompt under one of
     _PROMPT_KEYS, so an RTS attack_log.jsonl loads without conversion.
+
+    DEDUPLICATES on prompt text, which is not optional for the RTS corpus: it logs
+    one row per target, so an attack fired at six targets appears six times. Left
+    in, every metric would be weighted by how many targets each attack happened to
+    hit -- an artifact of the red-team run schedule, not of Shield's behaviour.
     """
     text = path.read_text(encoding="utf-8")
     if path.suffix == ".jsonl":
@@ -163,23 +199,90 @@ def load_prompts(path: Path) -> List[str]:
     else:
         rows = json.loads(text)
 
-    prompts: List[str] = []
+    pairs: List[Tuple[str, str]] = []
+    seen = set()
+    duplicates = 0
     for row in rows:
+        prompt, group = None, _UNGROUPED
         if isinstance(row, str):
-            prompts.append(row)
-            continue
-        if isinstance(row, dict):
+            prompt = row
+        elif isinstance(row, dict):
             for key in _PROMPT_KEYS:
                 if row.get(key):
-                    prompts.append(row[key])
+                    prompt = row[key]
                     break
-    if not prompts:
+            for key in _GROUP_KEYS:
+                if row.get(key):
+                    group = str(row[key])
+                    break
+        if not prompt:
+            continue
+        key_ = prompt.strip()
+        if key_ in seen:
+            duplicates += 1
+            continue
+        seen.add(key_)
+        pairs.append((prompt, group))
+
+    if not pairs:
         raise ValueError(f"No prompts found in {path} (looked for {_PROMPT_KEYS}).")
-    return prompts
+    if duplicates:
+        logger.info("%s: kept %d unique prompts, dropped %d duplicates.",
+                    path.name, len(pairs), duplicates)
+    return pairs
+
+
+def load_many(paths: List[Path]) -> List[Tuple[str, str]]:
+    """Load several corpora into one list, deduplicating ACROSS files as well as
+    within them.
+
+    The benign set is split by provenance -- ordinary traffic in one file, the
+    hand-written hard negatives in another -- so each stays legible and editable.
+    Cross-file dedup matters because the same obvious prompt can plausibly be
+    written into both.
+    """
+    pairs: List[Tuple[str, str]] = []
+    seen = set()
+    for path in paths:
+        for prompt, group in load_prompts(path):
+            key = prompt.strip()
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((prompt, group))
+    return pairs
+
+
+def by_group(groups: List[str], scores: List[float], threshold: float) -> Dict[str, Tuple[int, int]]:
+    """Per-slice {group: (flagged, total)} at a threshold.
+
+    For attacks, flagged/total is recall for that category. For benign prompts it
+    is the false-positive rate for that subtype.
+    """
+    tally: Dict[str, List[int]] = {}
+    for group, score in zip(groups, scores):
+        slot = tally.setdefault(group, [0, 0])
+        slot[1] += 1
+        if score >= threshold:
+            slot[0] += 1
+    return {g: (hit, total) for g, (hit, total) in tally.items()}
+
+
+def print_groups(title: str, tally: Dict[str, Tuple[int, int]], rate_label: str) -> None:
+    """Print a per-slice breakdown, worst rate first."""
+    if len(tally) <= 1 and _UNGROUPED in tally:
+        return  # nothing to break down: the corpus carried no labels
+    print(f"\n  {title}")
+    rows = sorted(tally.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 0)
+    if rate_label == "recall":
+        rows = list(reversed(rows))
+    for group, (hit, total) in rows:
+        rate = hit / total if total else 0.0
+        print(f"    {group:34} {rate_label} {rate:6.1%}  ({hit}/{total})")
 
 
 def run_all(
-    detector: EnsembleDetector, prompts: List[str]
+    detector: EnsembleDetector, prompts: List[str], workers: int = 1
 ) -> Tuple[List[EnsembleResult], List[float]]:
     """Score each prompt once (threshold=0) so the sweep can reuse the results.
 
@@ -188,15 +291,25 @@ def run_all(
     Also returns per-prompt wall time in ms, so any latency figure in the docs
     comes from a measurement rather than an estimate. With --adjudicator that
     time includes the LLM round-trip for prompts inside the band.
+
+    workers > 1 overlaps those round-trips, which is the difference between a
+    wide-band adjudicated run finishing in minutes and in hours. It is only for
+    the network-bound case: the timings it produces are contended and must not be
+    quoted as engine latency, which is why --out records the worker count.
     """
-    results: List[EnsembleResult] = []
-    elapsed_ms: List[float] = []
-    for prompt in prompts:
+    def score(prompt: str) -> Tuple[EnsembleResult, float]:
         start = time.perf_counter()
         result = detector.detect(prompt, threshold=0)
-        elapsed_ms.append((time.perf_counter() - start) * 1000.0)
-        results.append(result)
-    return results, elapsed_ms
+        return result, (time.perf_counter() - start) * 1000.0
+
+    if workers > 1:
+        # Ordered map: results must stay aligned with prompts/groups/labels.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            scored = list(pool.map(score, prompts))
+    else:
+        scored = [score(p) for p in prompts]
+
+    return [r for r, _ in scored], [ms for _, ms in scored]
 
 
 def _percentile(values: List[float], pct: float) -> float:
@@ -231,9 +344,18 @@ def _provenance(prompt: str, result: EnsembleResult, label: str, index: int) -> 
     # an abstain; the 'adjudicator' key in method_scores appears only when it
     # returned a usable verdict and overrode the fast-path score.
     ran = result.details.get("adjudicator") is not None
-    overrode = "adjudicator" in scores
+    scored = "adjudicator" in scores
+    # The tier is escalate-only, so a judge verdict is kept only when it exceeded
+    # the fast-path score. That splits one old flag into two questions that now
+    # have different answers: did the judge return anything usable (scored), and
+    # did it actually move the verdict (raised)? A run where scored is high but
+    # raised is zero is working and agreeing; a run where scored is near zero is
+    # abstaining and has measured nothing. Conflating them hides the second case.
+    fast_score = result.details.get("fast_path_score")
+    raised = fast_score is not None and result.risk_score > fast_score + 1e-9
+    overrode = scored  # retained: existing --out consumers key off this name
 
-    if overrode:
+    if raised:
         decided_by = "adjudicator"
     elif scores.get("rule_based", 0.0) >= _RULE_OVERRIDE:
         decided_by = "rule_override"
@@ -251,7 +373,11 @@ def _provenance(prompt: str, result: EnsembleResult, label: str, index: int) -> 
         "decided_by": decided_by,
         "method_scores": {k: round(v, 2) for k, v in scores.items()},
         "adjudicator_ran": ran,
+        "adjudicator_scored": scored,
+        "adjudicator_raised": raised,
         "adjudicator_overrode": overrode,
+        "fast_path_score": round(fast_score, 2) if fast_score is not None else None,
+        "adjudicator_verdict": result.details.get("adjudicator_verdict"),
         "adjudicator_reason": result.details.get("adjudicator"),
     }
 
@@ -299,10 +425,27 @@ def _build_adjudicator():
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Prompt Shield detection.")
-    parser.add_argument("--attacks", type=Path, help="JSON/JSONL of malicious prompts.")
-    parser.add_argument("--benign", type=Path, help="JSON/JSONL of clean prompts.")
-    parser.add_argument("--threshold", type=float, default=50.0, help="Single threshold to report.")
-    parser.add_argument("--sweep", action="store_true", help="Report metrics across many thresholds.")
+    parser.add_argument("--attacks", type=Path, nargs="+",
+                        help="JSON/JSONL of malicious prompts. Several files are concatenated "
+                             "and deduplicated across all of them.")
+    parser.add_argument("--benign", type=Path, nargs="+",
+                        help="JSON/JSONL of clean prompts. Several files are concatenated "
+                             "and deduplicated across all of them.")
+    parser.add_argument("--threshold", type=float, default=50.0,
+                        help="Operating threshold. Everything is reported here unless "
+                             "--pick-threshold is passed. Choose it on DEV, then apply it "
+                             "unchanged to held-out data.")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Also print metrics across many thresholds. Informational only: "
+                             "it does not move the reported operating point.")
+    parser.add_argument("--pick-threshold", action="store_true",
+                        help="Report at the best-F1 threshold instead of --threshold. DEV ONLY. "
+                             "On held-out data this fits the threshold to the test set, and "
+                             "every number it produces is optimistic by an unknown margin.")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Score prompts concurrently. Worth using only with --adjudicator, "
+                             "where each escalated prompt costs a network round-trip. It makes "
+                             "the latency figures contended, so they stop being engine speed.")
     parser.add_argument("--out", type=Path, help="Optional path to write full results as JSON.")
     parser.add_argument("--adjudicator", action="store_true",
                         help="Enable the deep LLM tier (needs API access).")
@@ -317,16 +460,27 @@ def main() -> None:
     if not 0.0 <= floor < ceil <= 100.0:
         parser.error(f"--band requires 0 <= FLOOR < CEIL <= 100, got {floor} {ceil}")
 
-    attacks = load_prompts(args.attacks) if args.attacks else _STARTER_ATTACKS
-    benign = load_prompts(args.benign) if args.benign else _STARTER_BENIGN
+    attack_pairs = (load_many(args.attacks) if args.attacks
+                    else [(p, "starter") for p in _STARTER_ATTACKS])
+    benign_pairs = (load_many(args.benign) if args.benign
+                    else [(p, "starter") for p in _STARTER_BENIGN])
     using_starter = not (args.attacks and args.benign)
+
+    attacks = [p for p, _ in attack_pairs]
+    benign = [p for p, _ in benign_pairs]
+    attack_groups = [g for _, g in attack_pairs]
+    # Benign slices roll up on the prefix: ordinary/coding -> ordinary. Real
+    # traffic is overwhelmingly ordinary, so a blended FPR that folds in a large
+    # hand-picked hard-negative set reads far worse than production would.
+    benign_groups = [g for _, g in benign_pairs]
+    benign_classes = [g.split("/")[0] for g in benign_groups]
 
     logger.info("Scoring %d attacks and %d benign prompts...", len(attacks), len(benign))
     adjudicator = _build_adjudicator() if args.adjudicator else None
     detector = EnsembleDetector(adjudicator=adjudicator, borderline_band=(floor, ceil))
     logger.info("Deep LLM tier: %s", f"ON (band {floor:.0f}-{ceil:.0f})" if adjudicator else "OFF")
-    attack_results, attack_ms = run_all(detector, attacks)
-    benign_results, benign_ms = run_all(detector, benign)
+    attack_results, attack_ms = run_all(detector, attacks, args.workers)
+    benign_results, benign_ms = run_all(detector, benign, args.workers)
     attack_scores = [r.risk_score for r in attack_results]
     benign_scores = [r.risk_score for r in benign_results]
     latency = latency_stats(attack_ms + benign_ms)
@@ -338,18 +492,53 @@ def main() -> None:
     print(f"  attacks: {len(attacks)}   benign: {len(benign)}   deep LLM tier: {tier}\n")
     print("  thr   | accuracy | precision | recall  | F1     | FPR")
 
-    thresholds = _SWEEP if args.sweep else [args.threshold]
+    thresholds = sorted(set(_SWEEP + [args.threshold])) if args.sweep else [args.threshold]
     results = [metrics_at(attack_scores, benign_scores, t) for t in thresholds]
     for m in results:
         print_row(m)
 
-    best = max(results, key=lambda m: m.f1)
+    # The operating point is --threshold, not the best row above. Choosing it
+    # from this table on held-out data is threshold fitting: the sweep is
+    # computed from the very prompts the number is supposed to be judged on, so
+    # the best row is the luckiest one rather than the one that will hold up.
+    # Pick it on DEV, then apply it here unchanged.
+    best_f1 = max(results, key=lambda m: m.f1)
+    if args.pick_threshold:
+        operating = best_f1
+        print(f"\n  !! --pick-threshold: reporting at the best-F1 row, threshold "
+              f"{operating.threshold:.0f}. Valid on DEV only -- on held-out data")
+        print("     this fits the threshold to the test set and flatters every metric.")
+    else:
+        operating = metrics_at(attack_scores, benign_scores, args.threshold)
+        if args.sweep and best_f1.threshold != operating.threshold:
+            print(f"\n  (sweep peaks at F1 {best_f1.f1:.1%}, threshold {best_f1.threshold:.0f} -- "
+                  f"not adopted; the operating point stays where DEV put it)")
+
     print(
-        f"\n  Best F1 at threshold {best.threshold:.0f}: "
-        f"F1 {best.f1:.1%}, recall {best.recall:.1%}, FPR {best.fpr:.1%}"
+        f"\n  Operating point, threshold {operating.threshold:.0f}: "
+        f"recall {operating.recall:.1%}, FPR {operating.fpr:.1%}, "
+        f"precision {operating.precision:.1%}, F1 {operating.f1:.1%}"
+    )
+
+    # Per-slice breakdown at the best-F1 threshold. One blended number hides which
+    # attack categories the detector is blind to and which benign traffic it
+    # misfires on; these two tables are the honest version of the headline.
+    print_groups(
+        f"Recall by attack category (threshold {operating.threshold:.0f}):",
+        by_group(attack_groups, attack_scores, operating.threshold), "recall",
+    )
+    print_groups(
+        f"False positives by benign class (threshold {operating.threshold:.0f}):",
+        by_group(benign_classes, benign_scores, operating.threshold), "FPR",
+    )
+    print_groups(
+        f"False positives by benign subtype (threshold {operating.threshold:.0f}):",
+        by_group(benign_groups, benign_scores, operating.threshold), "FPR",
     )
 
     scope = "includes LLM round-trips" if adjudicator else "fast path only"
+    if args.workers > 1:
+        scope += f", contended across {args.workers} workers"
     print(
         f"\n  Latency per prompt ({scope}): "
         f"p50 {latency['p50']:.2f} ms, p95 {latency['p95']:.2f} ms, "
@@ -371,14 +560,14 @@ def main() -> None:
         )
 
     # Surface the mistakes so they get fixed, not hidden.
-    missed = [a for a, s in zip(attacks, attack_scores) if s < best.threshold]
-    false_pos = [b for b, s in zip(benign, benign_scores) if s >= best.threshold]
+    missed = [a for a, s in zip(attacks, attack_scores) if s < operating.threshold]
+    false_pos = [b for b, s in zip(benign, benign_scores) if s >= operating.threshold]
     if missed:
-        print(f"\n  Missed attacks ({len(missed)}) at threshold {best.threshold:.0f}:")
+        print(f"\n  Missed attacks ({len(missed)}) at threshold {operating.threshold:.0f}:")
         for a in missed:
             print(f"    - {a[:90]}")
     if false_pos:
-        print(f"\n  False positives ({len(false_pos)}) at threshold {best.threshold:.0f}:")
+        print(f"\n  False positives ({len(false_pos)}) at threshold {operating.threshold:.0f}:")
         for b in false_pos:
             print(f"    - {b[:90]}")
 
@@ -387,10 +576,18 @@ def main() -> None:
             # Recorded so two result files can be told apart when comparing runs.
             "adjudicator": bool(adjudicator),
             "band": [floor, ceil] if adjudicator else None,
+            # How the reported operating point was chosen. A results file that
+            # does not carry this cannot be audited later for threshold fitting,
+            # because a fitted number and an honest one look identical on paper.
+            "operating_threshold": operating.threshold,
+            "threshold_selected_on": "this run (best F1)" if args.pick_threshold else "dev",
+            "workers": args.workers,
             "latency_ms": {
                 **{k: round(v, 4) for k, v in latency.items()},
                 # Adjudicated runs are network-bound; don't quote them as engine speed.
                 "includes_llm_calls": bool(adjudicator),
+                # Concurrent runs measure queueing as much as work.
+                "contended": args.workers > 1,
             },
             "attacks": len(attacks),
             "benign": len(benign),
@@ -402,6 +599,23 @@ def main() -> None:
                 }
                 for m in results
             ],
+            # Per-slice rates at the best-F1 threshold, so a reader can see where
+            # coverage degrades rather than only the blended figure.
+            "by_slice": {
+                "threshold": operating.threshold,
+                "attack_recall": {
+                    g: {"flagged": h, "total": t, "rate": (h / t if t else 0.0)}
+                    for g, (h, t) in by_group(attack_groups, attack_scores, operating.threshold).items()
+                },
+                "benign_fpr_by_class": {
+                    g: {"flagged": h, "total": t, "rate": (h / t if t else 0.0)}
+                    for g, (h, t) in by_group(benign_classes, benign_scores, operating.threshold).items()
+                },
+                "benign_fpr_by_subtype": {
+                    g: {"flagged": h, "total": t, "rate": (h / t if t else 0.0)}
+                    for g, (h, t) in by_group(benign_groups, benign_scores, operating.threshold).items()
+                },
+            },
             # Per-prompt provenance: which tier decided each verdict. Join two
             # runs on "id" to diff fast-path vs deep-path prompt by prompt.
             "per_prompt": [

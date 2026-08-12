@@ -8,8 +8,9 @@
 
 Prompt-Shield detects prompt injection attempts against Large Language Models. Three
 deterministic layers (rule, statistical, semantic) score every prompt in well under a
-millisecond, and an optional LLM adjudication tier re-examines only the borderline
-cases the fast layers are unsure about — the ones where regex has no answer.
+millisecond, and an optional LLM adjudication tier re-examines whatever the fast path
+does not resolve — the cases where regex has no answer. How much traffic that is
+depends entirely on the band you configure, and on this corpus it is most of it.
 
 Every accuracy claim below comes from `benchmark.py`, which is in this repo and which
 you can run yourself. Where the evaluation set is too small to support a claim, that
@@ -34,7 +35,7 @@ is stated rather than rounded away.
 ### 🎛️ Operational Features
 - **Configurable Thresholds**: Tune for your risk tolerance
 - **Fast Path**: Deterministic layers score in well under a millisecond (measured; see Performance)
-- **Optional LLM Adjudication**: Deep tier fires only on borderline scores, so cost stays bounded
+- **Optional LLM Adjudication**: Deep tier fires on a configurable score band; a narrow band bounds cost, a floor of 0 escalates nearly everything. Escalate-only — it can raise a score, never lower one
 - **Detailed Explanations**: Every verdict reports which layer produced it
 - **Easy Integration**: Simple API for any Python application
 
@@ -180,11 +181,22 @@ custom_detector = EnsembleDetector(
 
 ### Optional LLM adjudication tier
 
-The deep tier is off unless you supply an adjudicator. It only runs on prompts whose
-fast-path score falls inside `borderline_band`, so LLM cost is bounded to the fraction
-of traffic the deterministic layers are genuinely unsure about. On any failure — a
-timeout, malformed output, or a jailbreak attempt against the adjudicator itself — it
-abstains and the fast-path verdict stands.
+The deep tier is off unless you supply an adjudicator. It runs on prompts whose
+fast-path score falls inside `borderline_band`, half-open `[floor, ceil)`, so that band
+is your cost dial and not a detail. A narrow band around genuinely ambiguous scores
+keeps LLM spend to a small share of traffic. A floor of `0.0` escalates everything the
+rules did not confidently block, which on this corpus is the large majority of prompts:
+the deterministic layers score whole attack categories at exactly zero, so a zero is
+absence of evidence rather than evidence of innocence. Measure the split for your own
+traffic with `benchmark.py --adjudicator` before assuming either shape.
+
+The tier is **escalate-only**: it may raise a score, never lower one. Its input is
+attacker-controlled, so a prompt that talks the judge into calling it benign must not
+be able to talk a flagged score back down. The trade is one-sided and worth stating:
+adjudication cannot clear a fast-path false positive, so this tier buys recall and can
+only add to the false-positive rate. On any failure — a timeout, malformed output, or a
+jailbreak attempt against the adjudicator itself — it abstains and the fast-path verdict
+stands.
 
 ```python
 from detection.adjudicator import LLMAdjudicator

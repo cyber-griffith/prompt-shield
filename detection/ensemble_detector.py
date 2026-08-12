@@ -857,24 +857,56 @@ class EnsembleDetector:
         if rule_score >= 70:
             ensemble_score = max(ensemble_score, rule_score)
             
-        # Deep-inspection tier: only for borderline scores the fast layers are
-        # unsure about. A confident fast-path decision is never second-guessed,
-        # which is also what keeps the LLM cost bounded to a fraction of prompts.
+        # Deep-inspection tier. The band is the escalation policy: the score
+        # range the fast layers are not trusted to resolve alone. Anything inside
+        # it goes to the LLM, anything outside keeps the fast-path verdict.
+        # Half-open [floor, ceil) so a ceiling set at the rule-override cutoff
+        # cannot re-escalate a prompt the rules already blocked.
+        #
+        # This is not a borderline-only sampler, and describing it as one
+        # understates the bill. With a floor of 0 the design is a deterministic
+        # high-precision fast path that blocks confident rule hits and
+        # short-circuits the LLM, plus an LLM that adjudicates everything else --
+        # roughly nine prompts in ten. Cost scales with traffic rather than with
+        # a small uncertain slice. That is deliberate: the fast layers score
+        # whole attack categories at exactly zero, so a zero here is absence of
+        # evidence, not evidence of innocence, and a floor above it would
+        # silently exclude most of the attacks worth catching.
+        #
+        # SECURITY -- escalate-only: this tier may raise a score, never lower
+        # one. Its input is attacker-controlled, so a prompt that successfully
+        # injects the judge into calling itself benign must not be able to talk
+        # a flagged score back down to safe. max() means a hijacked, confused,
+        # or failing judge degrades to the deterministic fast-path verdict
+        # instead of below it; abstain (score is None) gives the same guarantee
+        # by leaving the score alone. The cost is real and one-sided: the tier
+        # can no longer clear a fast-path false positive, so it adds risk or
+        # does nothing, and FPR can only rise. Recall is what it buys.
+        # Captured before the deep tier can touch it so provenance can tell a
+        # raise from an agreement exactly, instead of inferring it by comparing
+        # floats after the fact.
+        fast_path_score = ensemble_score
+
         adjudication = None
-        if self.adjudicator is not None and self._band[0] <= ensemble_score <= self._band[1]:
+        if self.adjudicator is not None and self._band[0] <= ensemble_score < self._band[1]:
             adjudication = self.adjudicator.adjudicate(prompt)
             if adjudication.score is not None:  # None means it abstained; leave score alone
-                ensemble_score = adjudication.score
+                # VERDICT GATE: only a positive finding may move the score. A
+                # 'benign' verdict carries a nonzero cleared score, and under
+                # escalate-only max() that score can only ever push a quiet
+                # prompt UP -- so the judge saying "this is safe" would raise
+                # risk on everything the fast path scored below it. Gating on
+                # the verdict makes a clear a true no-op, which is what it
+                # means. Raw score is still recorded below either way.
+                if adjudication.verdict == "injection":
+                    ensemble_score = max(ensemble_score, adjudication.score)
                 method_scores["adjudicator"] = adjudication.score
 
-        is_injection = ensemble_score >= threshold
-        
         # Calculate confidence based on agreement
         confidence = self._calculate_confidence(method_scores)
-        
-        # Determine if injection
+
         is_injection = ensemble_score >= threshold
-        
+
         # Compile details
         details = {
             "rule_based": rule_details,
@@ -882,8 +914,14 @@ class EnsembleDetector:
             "semantic": semantic_details,
             "threshold": threshold,
             "agreement_level": confidence,
-            "adjudicator": adjudication.reason 
-                if adjudication else None
+            # The score as the deterministic layers left it. Kept so a caller can
+            # separate "the deep tier raised this" from "the deep tier agreed"
+            # without re-deriving the fast path.
+            "fast_path_score": fast_path_score,
+            "adjudicator": adjudication.reason
+                if adjudication else None,
+            "adjudicator_verdict": adjudication.verdict
+                if adjudication else None,
         }
         
         # Identify contributing methods
