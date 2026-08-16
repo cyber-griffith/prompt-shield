@@ -205,7 +205,10 @@ from detection.adjudicator import LLMAdjudicator
 # this module imports no SDK. Make it deterministic and time-bounded.
 detector = EnsembleDetector(
     adjudicator=LLMAdjudicator(chat_fn),
-    borderline_band=(20.0, 65.0),
+    # Floor of 0 is what the Performance figures were measured with. A floor of
+    # 20 routes ~2% of real traffic and leaves recall roughly where the fast
+    # path had it, because the attacks it misses score 0, not 20.
+    borderline_band=(0.0, 65.0),
 )
 ```
 
@@ -286,49 +289,104 @@ print(f"Most Effective Evasion: {report.most_effective_evasion}")
 
 ## 📊 Performance
 
-**These numbers come from a 28-prompt starter set. That is too small to be a
-headline result, and it is reported here rather than rounded into something
-that sounds better.** One prompt moves any rate by roughly 7 points.
+Measured on a **held-out set of 500 attacks and 334 benign prompts**. The attacks
+are deduplicated red-team output; the benign set is 254 ordinary prompts plus 80
+hand-written hard negatives — benign prompts built to look like attacks.
+
+The operating threshold of 50 was chosen on a separate 28-prompt development set
+and applied to the held-out set once. It is deliberately **not** read off the
+sweep below: picking the best row from the data you are reporting on fits the
+threshold to the test set and inflates every figure that follows.
 
 Reproduce both rows:
 
 ```bash
-python benchmark.py --sweep --out fast.json
-python benchmark.py --sweep --adjudicator --band 20 65 --out deep.json
-python compare_runs.py fast.json deep.json --threshold 20
+python benchmark.py --attacks eval/attacks_test.jsonl --benign eval/benign_test.jsonl \
+  --threshold 50 --sweep --out fast_test.json
+python benchmark.py --attacks eval/attacks_test.jsonl --benign eval/benign_test.jsonl \
+  --threshold 50 --sweep --adjudicator --band 0 65 --out deep_test.json
+python compare_runs.py fast_test.json deep_test.json --threshold 50
 ```
 
-Measured at threshold 20 on 14 attack and 14 benign prompts:
+| Configuration | Accuracy | Precision | Recall | FPR | F1 |
+| --- | --- | --- | --- | --- | --- |
+| Fast path only | 48.9% | 92.0% | 16.2% | 2.1% | 27.6% |
+| Fast path + LLM adjudication | 76.6% | 96.6% | 63.2% | 3.3% | 76.4% |
 
-| Configuration | Accuracy | Recall | FPR | F1 |
-| --- | --- | --- | --- | --- |
-| Fast path only | 92.9% | 100% | 14.3% | 93.3% |
-| Fast path + LLM adjudication | 96.4% | 100% | 7.1% | 96.6% |
+**The fast path alone misses most real attacks.** 16.2% recall is the honest
+number for regex, statistics and keyword-semantics against attacks that were not
+written to match them — 263 of the 500 score exactly 0.0, meaning the
+deterministic layers produce no signal at all, not a weak one. What they do well
+is precision: 92% of what they flag is real, and they never fire on ordinary
+traffic.
 
-The point of that pair is not the absolute figures — it is that the fast path
-cannot hold 100% recall and a low false-positive rate at the same time. Raising
-the threshold to cut false positives drops its recall to 85.7%. The adjudication
-tier holds recall at 100% while halving the false-positive rate, because it
-re-examines exactly the prompts the deterministic layers score as ambiguous.
+The adjudication tier is what makes the system work, and it is not cheap. At band
+`0-65` it escalates **89.4% of all prompts** to the LLM, because a fast-path score
+of zero is absence of evidence rather than evidence of innocence.
 
-**Latency**, fast path only, measured by `benchmark.py` on the same set:
+**Run-to-run variance:** the adjudicated row moves. Three runs of the identical
+configuration produced recall 61.6% / 62.6% / 63.2% and FPR 3.9% / 3.9% / 3.3%.
+Treat the deep figures as ±1 point. The fast path is deterministic and does not
+move at all.
 
-| Percentile | Per prompt |
-| --- | --- |
-| p50 | 0.09 ms |
-| p95 | 0.13 ms |
+### Recall by attack category
 
-Measured on an Intel i7-13xxx, Windows 11, Python 3.14. Adjudicated runs are
-network-bound and are not comparable — `--out` records `includes_llm_calls` so
-the two are never confused.
+| Category | Fast | + Adjudication |
+| --- | --- | --- |
+| prompt_injection | 43.0% | 90.7% |
+| privilege_escalation | 3.0% | 89.4% |
+| jailbreak | 13.8% | 68.3% |
+| data_exfiltration | 1.2% | 61.3% |
+| output_manipulation | 21.8% | 38.6% |
+| denial_of_service | 4.5% | 15.9% |
+
+The tier rescues attacks that are semantically hostile but lexically innocuous —
+social engineering and function-call payloads that contain no trigger words.
+It barely moves denial-of-service or output manipulation, which tend to be
+structural rather than persuasive, so a classifier reading intent has little
+to grip.
+
+### False positives by benign class
+
+| Class | Fast | + Adjudication |
+| --- | --- | --- |
+| ordinary (254) | 0.0% | 0.0% |
+| security_ops (13) | 0.0% | 0.0% |
+| trigger_word (20) | 0.0% | 5.0% |
+| meta_discussion (12) | 8.3% | 8.3% |
+| roleplay (20) | 0.0% | 10.0% |
+| quoted_attack (15) | 40.0% | 46.7% |
+
+Ordinary traffic is clean in both configurations. Every false positive comes from
+the hard negatives, and the blended 2.1%/3.3% figures understate what a user
+would experience only insofar as your traffic contains prompts that quote
+attacks or assign roles.
+
+**Latency**, per prompt, measured by `benchmark.py` on the same set:
+
+| Percentile | Fast path | + Adjudication |
+| --- | --- | --- |
+| p50 | 0.17 ms | 1473 ms |
+| p95 | 0.81 ms | 3216 ms |
+
+Measured on an Intel i7-13xxx, Windows 11, Python 3.14, single-threaded.
+Adjudicated runs are network-bound and are not engine speed — `--out` records
+`includes_llm_calls` and `contended` so the two are never confused.
 
 ### Known limits
 
-- **The evaluation set is too small.** 28 prompts. Replace it via `--attacks` and
-  `--benign` before treating any figure above as a result.
-- **The adjudication band was fitted to this set.** The `20` floor was chosen by
-  inspecting where the missed attacks scored. It must be re-derived on a real
-  corpus; recall will not transfer for free.
+- **Recall depends on an LLM, latency, and a per-prompt bill.** Without the deep
+  tier this is a 16% recall detector. The deterministic layers are a precision
+  filter and a cost optimizer, not the product.
+- **The adjudicator went silent on 81 of 746 escalated prompts** and abstained.
+  Every one was an attack, and all remained missed — roughly 16 points of recall
+  left on the table. Most returned empty output rather than a refusal or a parse
+  error. A classifier that fails specifically on hostile input fails where it is
+  needed; see `abstain:` cause codes in `--out`.
+- **Adjudication can only add false positives.** The tier is escalate-only: it
+  may raise a score, never lower one, so a compromised or injected judge degrades
+  to the fast-path verdict instead of below it. The cost is that it cannot clear
+  a fast-path false positive.
 - **The rule layer produces false positives on quoted attacks.** A benign prompt
   that *quotes* an injection ("I'm writing a story where a hacker says 'ignore all
   previous instructions'...") scores 85 from pattern matching alone. Quoted-versus-
@@ -596,7 +654,8 @@ Prompt-Shield is a detection tool, not a guarantee of security. It should be use
 - Rule Categories: 6 (instruction manipulation, role manipulation, prompt leaking,
   jailbreak, context manipulation, policy negation)
 - Deobfuscation: base64, hex, ROT13, NFKC homoglyph folding, zero-width stripping
-- Evaluation Set: 28 prompts (see Performance — this is the number that needs to grow)
+- Evaluation Set: 834 held-out prompts (500 attacks, 254 ordinary benign, 80 hard
+  negatives), plus a separate 28-prompt development set used only to pick the threshold
 
 Accuracy figures are deliberately not repeated here. They live in one place,
 [Performance](#-performance), so they cannot drift out of sync.
