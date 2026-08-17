@@ -310,8 +310,25 @@ python compare_runs.py fast_test.json deep_test.json --threshold 50
 
 | Configuration | Accuracy | Precision | Recall | FPR | F1 |
 | --- | --- | --- | --- | --- | --- |
-| Fast path only | 48.9% | 92.0% | 16.2% | 2.1% | 27.6% |
-| Fast path + LLM adjudication | 76.6% | 96.6% | 63.2% | 3.3% | 76.4% |
+| Fast path only — deterministic | 48.9% | 92.0% | 16.2% | 2.1% | 27.6% |
+| Fast path + LLM adjudication — range over 3 runs | 75.4–76.6% | 96.0–96.6% | 61.6–63.2% | 3.3–3.9% | 75.0–76.4% |
+
+**Quote the adjudicated system as roughly 62% recall at about 4% FPR.**
+
+Those cells are ranges rather than single values because the tier calls an LLM.
+Three runs of the identical configuration on the identical corpus produced recall
+61.6 / 62.6 / 63.2% and FPR 3.9 / 3.9 / 3.3% — mean 62.5% and 3.7%. One run did
+score 63.2% recall at 3.3% FPR, the best result on both axes at once; quoting it
+as the headline would be **publishing the best of three as though it were the
+expected one**. Two of the three runs gave 3.9% FPR, which is why the headline
+rounds to 4% and not 3%, and 62% rather than 63% for the same reason.
+
+The fast path is deterministic and does not move between runs at all, so its row
+is exact.
+
+(The earliest of the three runs predates the escalate-only verdict gate. Its
+threshold-50 figures are still comparable: that change only affects scores below
+15, and cannot alter an outcome decided at a threshold of 50.)
 
 **The fast path alone misses most real attacks.** 16.2% recall is the honest
 number for regex, statistics and keyword-semantics against attacks that were not
@@ -324,12 +341,12 @@ The adjudication tier is what makes the system work, and it is not cheap. At ban
 `0-65` it escalates **89.4% of all prompts** to the LLM, because a fast-path score
 of zero is absence of evidence rather than evidence of innocence.
 
-**Run-to-run variance:** the adjudicated row moves. Three runs of the identical
-configuration produced recall 61.6% / 62.6% / 63.2% and FPR 3.9% / 3.9% / 3.3%.
-Treat the deep figures as ±1 point. The fast path is deterministic and does not
-move at all.
-
 ### Recall by attack category
+
+Fast column is exact. Adjudicated column is a **single run** (`deep_test.json`,
+the highest-recall of the three) — the per-category splits were not captured for
+every run, so read them as shape rather than precision, subject to the same
+per-run movement as the headline.
 
 | Category | Fast | + Adjudication |
 | --- | --- | --- |
@@ -347,6 +364,10 @@ structural rather than persuasive, so a classifier reading intent has little
 to grip.
 
 ### False positives by benign class
+
+Same provenance as above: fast column exact, adjudicated column from the single
+lowest-FPR run. On the two runs at 3.9% the extra false positives fall in these
+same hard-negative classes, never in `ordinary`.
 
 | Class | Fast | + Adjudication |
 | --- | --- | --- |
